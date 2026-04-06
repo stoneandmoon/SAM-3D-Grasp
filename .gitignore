@@ -1,0 +1,12 @@
+.git/
+checkpoints/
+sam3d_checkpoints/
+.cache/
+output_3d/
+__pycache__/
+*.ckpt
+*.pth
+*.pt
+*.m4a
+pipeline_output_2D_result.jpg
+*.safetensors

@@ -1,27 +1,22 @@
-__pycache__/
-*.pyc
-*.pyo
+# 忽略安装包
+*.whl
 
-.env
-*.log
+# 忽略模型权重和大型数据集
+sam3d_checkpoints/
+ho3d_test/
+assets/
 
-data/
-dataset/
-datasets/
-output/
-outputs/
-runs/
-wandb/
-checkpoints/
-weights/
-pretrained/
-*.pth
-*.pt
-*.ckpt
-*.onnx
-*.npy
-*.npz
+# 忽略所有点云、图像、音频等测试产物
+*.ply
+*.jpg
+*.png
+*.m4a
 
-.vscode/
-.idea/
-.DS_Store
+# 忽略运行输出和日志文件夹
+output_*/
+debug_*/
+*.txt
+*.csv
+
+# 忽略代码备份文件
+*.bak*

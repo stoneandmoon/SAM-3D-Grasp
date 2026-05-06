@@ -1,6 +1,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 from typing import Union, Optional
 from copy import deepcopy
+import os
+import json
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -51,10 +53,6 @@ def recursive_fn_factory(fn):
             return tuple(recursive_fn(t) for t in b)
         if isinstance(b, torch.Tensor):
             return fn(b)
-        # Yes, writing out an explicit white list of
-        # trivial types is tedious, but so are bugs that
-        # come from not applying fn, when expected to have
-        # applied it.
         if b is None:
             return b
         trivial_types = [bool, int, float]
@@ -154,12 +152,7 @@ class InferencePipelinePointMap(InferencePipeline):
                     ss_return_dict = self.sample_sparse_structure(
                         ss_input_dict, inference_steps=None
                     )
-
-                    _ = self.run_layout_model(
-                        ss_input_dict,
-                        ss_return_dict,
-                        inference_steps=None,
-                    )
+                    # 老版本兼容：不跑 layout warmup
 
     def _preprocess_image_and_mask_pointmap(
         self, rgb_image, mask_image, pointmap, img_mask_pointmap_joint_transform
@@ -176,13 +169,12 @@ class InferencePipelinePointMap(InferencePipeline):
         preprocessor,
         pointmap=None,
     ) -> torch.Tensor:
-        # canonical type is numpy
         if not isinstance(image, np.ndarray):
             image = np.array(image)
 
-        assert image.ndim == 3  # no batch dimension as of now
-        assert image.shape[-1] == 4  # rgba format
-        assert image.dtype == np.uint8  # [0,255] range
+        assert image.ndim == 3
+        assert image.shape[-1] == 4
+        assert image.dtype == np.uint8
 
         rgba_image = torch.from_numpy(self.image_to_float(image))
         rgba_image = rgba_image.permute(2, 0, 1).contiguous()
@@ -192,8 +184,7 @@ class InferencePipelinePointMap(InferencePipeline):
         preprocessor_return_dict = preprocessor._process_image_mask_pointmap_mess(
             rgb_image, rgb_image_mask, pointmap
         )
-        
-        # Put in a for loop?
+
         _item = preprocessor_return_dict
         item = {
             "mask": _item["mask"][None].to(self.device),
@@ -210,12 +201,11 @@ class InferencePipelinePointMap(InferencePipeline):
             item["rgb_pointmap_scale"] = _item["rgb_pointmap_scale"][None].to(self.device)
             item["rgb_pointmap_shift"] = _item["rgb_pointmap_shift"][None].to(self.device)
 
-        # Add unnormed pointmap for post-optimization
         if pointmap is not None and preprocessor.pointmap_transform != (None,):
             full_pointmap = self._apply_transform(
                 pointmap, preprocessor.pointmap_transform
             )
-            item["rgb_pointmap_unnorm"] = full_pointmap[None].to(self.device)            
+            item["rgb_pointmap_unnorm"] = full_pointmap[None].to(self.device)
 
         return item
 
@@ -232,7 +222,6 @@ class InferencePipelinePointMap(InferencePipeline):
         ).squeeze(0)
 
         pointmap_flat = pointmap.reshape(3, -1)
-        # Get valid points from the mask
         mask_bool = mask_resized.reshape(-1) > 0.5
         mask_points = pointmap_flat[:, mask_bool]
         mask_distance = mask_points.nanmedian(dim=-1).values[-1]
@@ -246,17 +235,14 @@ class InferencePipelinePointMap(InferencePipeline):
         return pointmap_clipped
 
     def refine_scale(self, revised_scale):
-        # Check if all three channels of revised_scale are close to each other
         if not torch.allclose(revised_scale[0, 0:1], revised_scale[0, 1:2], atol=1e-3) or \
            not torch.allclose(revised_scale[0, 0:1], revised_scale[0, 2:3], atol=1e-3):
             logger.warning(
                 f"revised_scale values are not close (tolerance=1e-3): "
             )
-        # Use 3-channel mean value
         revised_scale = revised_scale.clone()
         mean_val = revised_scale.mean(dim=1, keepdim=True)
         revised_scale[:] = mean_val
-
         return revised_scale
 
     def compute_pointmap(self, image, pointmap=None):
@@ -281,21 +267,17 @@ class InferencePipelinePointMap(InferencePipeline):
             output = {}
             points_tensor = pointmap.to(self.device)
             if loaded_image.shape != points_tensor.shape:
-                # Interpolate points_tensor to match loaded_image size
-                # loaded_image has shape [3, H, W], we need H and W
                 points_tensor = torch.nn.functional.interpolate(
                     points_tensor.permute(2, 0, 1).unsqueeze(0),
                     size=(loaded_image.shape[1], loaded_image.shape[2]),
                     mode="nearest",
                 ).squeeze(0).permute(1, 2, 0)
             intrinsics = None
-        
-        # Prepare the point map tensor
+
         point_map_tensor = {
             "pts_color": loaded_image,
         }
 
-        # If depth model doesn't provide intrinsics, infer them
         if intrinsics is None:
             camera_convention_transform = (
                 Transform3d()
@@ -382,6 +364,58 @@ class InferencePipelinePointMap(InferencePipeline):
             "optim_accepted": flag_optim,
         }
 
+    def _dump_pose_debug(self, ss_return_dict, output_dir="/root/SAM-3D-Grasp/output_3d"):
+        """
+        调试辅助：
+        1) 打印 pose_decoder 后的全部 key
+        2) 导出关键 pose 字段到 json
+        """
+        print("\n[DEBUG] ===== ss_return_dict keys after pose_decoder =====")
+        for k, v in ss_return_dict.items():
+            try:
+                shape = tuple(v.shape) if hasattr(v, "shape") else str(type(v))
+            except Exception:
+                shape = str(type(v))
+            print(f"{k}: {shape}")
+        print("[DEBUG] =============================================\n")
+
+        debug_keys = [
+            "rotation", "translation", "scale",
+            "scene_scale", "scene_shift",
+            "x_instance_rotation", "x_instance_translation", "x_instance_scale",
+            "x_translation_scale",
+            "pose_target_dict", "pose_target",
+            "coords", "coords_original",
+            "6drotation_normalized",
+            "downsample_factor",
+        ]
+
+        debug_dump = {}
+
+        for key in debug_keys:
+            if key in ss_return_dict:
+                val = ss_return_dict[key]
+                try:
+                    if hasattr(val, "detach"):
+                        cpu_val = val.detach().cpu()
+                        print(f"[DEBUG] {key} = {cpu_val}")
+                        debug_dump[key] = cpu_val.numpy().tolist()
+                    else:
+                        print(f"[DEBUG] {key} = {val}")
+                        debug_dump[key] = str(val)
+                except Exception as e:
+                    print(f"[DEBUG] {key} = <print failed: {e}>")
+                    debug_dump[key] = f"<dump failed: {e}>"
+
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            dump_path = os.path.join(output_dir, "pose_debug_full.json")
+            with open(dump_path, "w", encoding="utf-8") as f:
+                json.dump(debug_dump, f, indent=2, ensure_ascii=False)
+            print(f"[DEBUG] full pose dump saved to {dump_path}")
+        except Exception as e:
+            print(f"[DEBUG] pose_debug_full.json 保存失败: {e}")
+
     def run(
         self,
         image: Union[None, Image.Image, np.ndarray],
@@ -401,7 +435,7 @@ class InferencePipelinePointMap(InferencePipeline):
         estimate_plane=False,
     ) -> dict:
         image = self.merge_image_and_mask(image, mask)
-        with self.device: 
+        with self.device:
             pointmap_dict = self.compute_pointmap(image, pointmap)
             pointmap = pointmap_dict["pointmap"]
             pts = type(self)._down_sample_img(pointmap)
@@ -423,7 +457,6 @@ class InferencePipelinePointMap(InferencePipeline):
                 use_distillation=use_stage1_distillation,
             )
 
-            # We could probably use the decoder from the models themselves
             pointmap_scale = ss_input_dict.get("pointmap_scale", None)
             pointmap_shift = ss_input_dict.get("pointmap_shift", None)
             ss_return_dict.update(
@@ -434,6 +467,9 @@ class InferencePipelinePointMap(InferencePipeline):
                 )
             )
 
+            # ===== DEBUG: pose_decoder 后的完整字段导出 =====
+            self._dump_pose_debug(ss_return_dict)
+
             logger.info(f"Rescaling scale by {ss_return_dict['downsample_factor']} after downsampling")
             ss_return_dict["scale"] = ss_return_dict["scale"] * ss_return_dict["downsample_factor"]
 
@@ -442,10 +478,9 @@ class InferencePipelinePointMap(InferencePipeline):
                 ss_return_dict["voxel"] = ss_return_dict["coords"][:, 1:] / 64 - 0.5
                 return {
                     **ss_return_dict,
-                    "pointmap": pts.cpu().permute((1, 2, 0)),  # HxWx3
-                    "pointmap_colors": pts_colors.cpu().permute((1, 2, 0)),  # HxWx3
+                    "pointmap": pts.cpu().permute((1, 2, 0)),
+                    "pointmap_colors": pts_colors.cpu().permute((1, 2, 0)),
                 }
-                # return ss_return_dict
 
             coords = ss_return_dict["coords"]
             slat = self.sample_slat(
@@ -504,20 +539,18 @@ class InferencePipelinePointMap(InferencePipeline):
             return {
                 **ss_return_dict,
                 **outputs,
-                "pointmap": pts.cpu().permute((1, 2, 0)),  # HxWx3
-                "pointmap_colors": pts_colors.cpu().permute((1, 2, 0)),  # HxWx3
+                "pointmap": pts.cpu().permute((1, 2, 0)),
+                "pointmap_colors": pts_colors.cpu().permute((1, 2, 0)),
             }
 
     @staticmethod
     def _down_sample_img(img_3chw: torch.Tensor):
-        # img_3chw: (3, H, W)
         x = img_3chw.unsqueeze(0)
         if x.dtype == torch.uint8:
             x = x.float() / 255.0
         max_side = max(x.shape[2], x.shape[3])
         scale_factor = 1.0
 
-        # heuristics
         if max_side > 3800:
             scale_factor = 0.125
         if max_side > 1900:
@@ -531,31 +564,25 @@ class InferencePipelinePointMap(InferencePipeline):
             mode="bilinear",
             align_corners=False,
             antialias=True,
-        )  # -> (1, 3, H/4, W/4)
+        )
         return x.squeeze(0)
 
     def estimate_plane(self, pointmap_dict, image, ground_area_threshold=0.25, min_points=100):
-        assert image.shape[-1] == 4  # rgba format
-        # Extract mask from alpha channel
+        assert image.shape[-1] == 4
         floor_mask = type(self)._down_sample_img(torch.from_numpy(image[..., -1]).float().unsqueeze(0))[0] > 0.5
         pts = type(self)._down_sample_img(pointmap_dict["pointmap"])
 
-        # Get all points in 3D space (H, W, 3)
         pts_hwc = pts.cpu().permute((1, 2, 0))
-
         valid_mask_points = floor_mask.cpu().numpy()
-        # Extract points that fall within the mask
+
         if valid_mask_points.any():
-            # Get points within mask
             masked_points = pts_hwc[valid_mask_points]
-            # Filter out invalid points (zero points from depth estimation failures)
             valid_points_mask = torch.norm(masked_points, dim=-1) > 1e-6
             valid_points = masked_points[valid_points_mask]
             points = valid_points.numpy()
         else:
             points = np.array([]).reshape(0, 3)
-     
-        # Calculate area coverage and check num of points
+
         overlap_area = estimate_plane_area(floor_mask)
         has_enough_points = len(points) >= min_points
 

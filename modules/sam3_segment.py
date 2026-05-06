@@ -7,7 +7,7 @@ from PIL import Image
 import gc
 
 # 确保指向你下载的官方仓库
-SAM3_REPO_BASE = "/home/zhn/下载/sam3"
+SAM3_REPO_BASE = "/root/SAM-3D-Grasp"
 if SAM3_REPO_BASE not in sys.path:
     sys.path.append(SAM3_REPO_BASE)
 
